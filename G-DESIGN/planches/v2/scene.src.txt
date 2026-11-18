@@ -1,0 +1,390 @@
+// Tangue planche scene (V2.1) — Tidewater language, pushed toward realism:
+// a lofted fishing-boat hull (round bilge, sheer, flare, boot stripe), a
+// detailed deck, a sea with real geometric swell (same function on the GPU
+// and for the boat), hull foam, bow wave and a Kelvin wake. No image asset.
+import * as THREE from 'three';
+import { Water } from 'three/examples/jsm/objects/Water.js';
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
+
+const SUN = new THREE.Vector3().setFromSphericalCoords(1, THREE.MathUtils.degToRad(90 - 17), THREE.MathUtils.degToRad(38));
+const BLUE = 0x1565c8, NAVY = 0x0f2742, WHITE = 0xf5f7fa;
+
+// ---------- the swell: one definition, used by GLSL and by JS ----------
+const WAVES = [
+  // amplitude (m), wavelength (m), direction (x, z), phase
+  [0.42, 34, 0.22, -1.0, 0.0],
+  [0.22, 19, -0.62, -0.78, 1.7],
+  [0.11, 10.5, 0.86, -0.5, 4.1],
+  [0.05, 5.6, -0.25, -0.97, 2.3],
+];
+const W = WAVES.map(([a, l, dx, dz, ph]) => { const n = Math.hypot(dx, dz), k = (2 * Math.PI) / l; return { a, k, dx: dx / n, dz: dz / n, w: Math.sqrt(9.81 * k) * 0.85, ph }; });
+const fade = (r) => 1 - THREE.MathUtils.smoothstep(r, 140, 460);
+function swell(x, z, t) {
+  let h = 0, gx = 0, gz = 0;
+  for (const v of W) { const th = v.k * (v.dx * x + v.dz * z) - v.w * t + v.ph; h += v.a * Math.sin(th); const c = v.a * v.k * Math.cos(th); gx += c * v.dx; gz += c * v.dz; }
+  const f = fade(Math.hypot(x, z));
+  return { h: h * f, gx: gx * f, gz: gz * f };
+}
+const GLSL_SWELL = `
+float swellH(vec2 p, float t, out vec2 g) {
+  float h = 0.0; g = vec2(0.0);
+  ${W.map((v) => `{ vec2 d = vec2(${v.dx.toFixed(5)}, ${v.dz.toFixed(5)}); float th = ${v.k.toFixed(5)} * dot(d, p) - ${v.w.toFixed(5)} * t + ${v.ph.toFixed(3)};
+    h += ${v.a.toFixed(4)} * sin(th); g += ${(v.a * v.k).toFixed(5)} * cos(th) * d; }`).join('\n  ')}
+  float f = 1.0 - smoothstep(140.0, 460.0, length(p));
+  g *= f; return h * f;
+}`;
+
+function normalMap(size) {
+  const data = new Uint8Array(size * size * 4), n = new THREE.Vector3();
+  const waves = [[1, 1, 1], [2, -1, 0.7], [-1, 4, 0.5], [5, 2, 0.32], [-4, -7, 0.24], [11, 3, 0.16], [-6, 13, 0.13], [17, -9, 0.1], [-23, 15, 0.08], [29, 7, 0.06], [-37, -21, 0.045], [43, 31, 0.035], [-53, 47, 0.028]];
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    let dx = 0, dy = 0;
+    const u = (x / size) * Math.PI * 2, v = (y / size) * Math.PI * 2;
+    for (const w of waves) { const c = Math.cos(w[0] * u + w[1] * v + w[1] * 0.9 + w[0] * 0.37) * w[2]; dx += c * w[0]; dy += c * w[1]; }
+    n.set(-dx * 0.05, -dy * 0.05, 1).normalize();
+    data.set([(n.x * 0.5 + 0.5) * 255, (n.y * 0.5 + 0.5) * 255, (n.z * 0.5 + 0.5) * 255, 255], (y * size + x) * 4);
+  }
+  const t = new THREE.DataTexture(data, size, size);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.magFilter = THREE.LinearFilter; t.minFilter = THREE.LinearMipmapLinearFilter; t.generateMipmaps = true; t.needsUpdate = true;
+  return t;
+}
+
+function foamNoise(size) {
+  const c = document.createElement('canvas'); c.width = c.height = size;
+  const g = c.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, size, size);
+  let s = 7;
+  const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
+  for (let i = 0; i < 2600; i++) {
+    const x = r() * size, y = r() * size, rad = 1 + r() * r() * 9, a = 0.08 + r() * 0.35;
+    for (const ox of [-size, 0, size]) for (const oy of [-size, 0, size]) {
+      const gr = g.createRadialGradient(x + ox, y + oy, 0, x + ox, y + oy, rad);
+      gr.addColorStop(0, `rgba(255,255,255,${a})`); gr.addColorStop(1, 'rgba(255,255,255,0)');
+      g.fillStyle = gr; g.fillRect(x + ox - rad, y + oy - rad, rad * 2, rad * 2);
+    }
+  }
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+
+// ---------- the hull: lofted from stations ----------
+const L = 13, B = 4.6;
+const halfBeam = (u) => (u < 0.55 ? (B / 2) * (0.84 + 0.16 * Math.sin((u / 0.55) * Math.PI / 2)) : (B / 2) * Math.pow(Math.cos(((u - 0.55) / 0.45) * Math.PI / 2), 0.72));
+const sheerH = (u) => 1.25 + 0.95 * Math.pow(u, 2.4);
+const keelD = (u) => { const k = 1.05 - 0.12 * u; return u > 0.84 ? k * (1 - ((u - 0.84) / 0.16) * 0.88) : k; };
+const zOf = (u) => -L / 2 + u * L;
+function sectionX(u, t) { // t: 0 at sheer, 1 at keel; flare above the waterline, round bilge below
+  const b = halfBeam(u);
+  return b * Math.pow(Math.max(0, 1 - Math.pow(t, 2.4)), 0.62) * (1 + 0.05 * (1 - t) * (1 - t));
+}
+const GLSL_BEAM = `float halfBeam(float u){ return u < 0.55 ? ${(B / 2).toFixed(3)} * (0.84 + 0.16 * sin(u / 0.55 * 1.5708)) : ${(B / 2).toFixed(3)} * pow(max(cos((u - 0.55) / 0.45 * 1.5708), 0.0), 0.72); }`;
+
+function hullGeometry() {
+  const N = 72, M = 30, pos = [], aW = [], aS = [], idx = [];
+  for (const side of [-1, 1]) {
+    const base = pos.length / 3;
+    for (let i = 0; i <= N; i++) {
+      const u = i / N, s = sheerH(u), k = keelD(u);
+      for (let j = 0; j <= M; j++) {
+        const t = j / M, y = s - (s + k) * t;
+        pos.push(side * sectionX(u, t), y, zOf(u)); aW.push(y); aS.push(y - s);
+      }
+    }
+    for (let i = 0; i < N; i++) for (let j = 0; j < M; j++) {
+      const a = base + i * (M + 1) + j, b2 = a + M + 1;
+      if (side > 0) idx.push(a, b2, a + 1, b2, b2 + 1, a + 1); else idx.push(a, a + 1, b2, b2, a + 1, b2 + 1);
+    }
+  }
+  // transom: a fan across the two stern sections
+  const c = pos.length / 3, s0 = sheerH(0), k0 = keelD(0);
+  pos.push(0, (s0 - k0) / 2, zOf(0)); aW.push((s0 - k0) / 2); aS.push(-1);
+  const port = [], star = [];
+  for (let j = 0; j <= M; j++) { port.push(j); star.push((N + 1) * (M + 1) + j); }
+  const loop = port.concat(star.slice().reverse());
+  for (let q = 0; q < loop.length; q++) idx.push(c, loop[q], loop[(q + 1) % loop.length]);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('aW', new THREE.Float32BufferAttribute(aW, 1));
+  g.setAttribute('aS', new THREE.Float32BufferAttribute(aS, 1));
+  g.setIndex(idx); g.computeVertexNormals();
+  return g;
+}
+
+function hullMaterial() {
+  const m = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.28, clearcoat: 1, clearcoatRoughness: 0.08, side: THREE.DoubleSide });
+  m.onBeforeCompile = (sh) => {
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute float aW; attribute float aS; varying float vW; varying float vS;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvW = aW; vS = aS;');
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying float vW; varying float vS;')
+      .replace('#include <color_fragment>', `#include <color_fragment>
+        vec3 hc = vec3(0.955, 0.965, 0.98);
+        if (vS > -0.5 && vS < -0.32) hc = vec3(0.082, 0.396, 0.784);
+        if (vS > -0.08) hc = vec3(0.082, 0.396, 0.784);
+        if (vW < 0.22) hc = vec3(0.082, 0.396, 0.784);
+        if (vW < 0.02) hc = vec3(0.059, 0.153, 0.259);
+        if (!gl_FrontFacing && vS > -0.6) hc = vec3(0.93, 0.95, 0.97);
+        diffuseColor.rgb = hc;`);
+  };
+  return m;
+}
+
+function plankTexture() {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 512;
+  const g = c.getContext('2d');
+  g.fillStyle = '#cdb38c'; g.fillRect(0, 0, 512, 512);
+  let s = 11; const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
+  for (let i = 0; i < 32; i++) {
+    const tone = 196 + Math.round(r() * 26);
+    g.fillStyle = `rgb(${tone},${tone - 22},${tone - 52})`; g.fillRect(i * 16, 0, 16, 512);
+    for (let k = 0; k < 14; k++) { g.fillStyle = `rgba(120,90,55,${0.05 + r() * 0.08})`; g.fillRect(i * 16 + r() * 16, r() * 512, 0.8, 30 + r() * 120); }
+    g.fillStyle = '#3d3226'; g.fillRect(i * 16, 0, 1.6, 512);
+    const b = r() * 512; g.fillRect(i * 16, b, 16, 1.2);
+  }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 8;
+  return t;
+}
+
+function deckGeometry() {
+  const N = 60, pos = [], uv = [], idx = [];
+  let rows = 0;
+  for (let i = 0; i <= N; i++) {
+    const u = (i / N) * 0.93, s = sheerH(u), y = s - 0.55, k = keelD(u);
+    const t = (s - y) / (s + k), x = sectionX(u, t) - 0.12;
+    if (x < 0.05) break;
+    pos.push(-x, y, zOf(u), x, y, zOf(u)); uv.push(-x / 4, zOf(u) / 4, x / 4, zOf(u) / 4); rows++;
+  }
+  for (let i = 0; i < rows - 1; i++) { const a = i * 2; idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3); }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx); g.computeVertexNormals();
+  return g;
+}
+
+function tubeAlong(points, r, mat) {
+  return new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), Math.max(8, points.length * 4), r, 8, false), mat);
+}
+
+function boat() {
+  const root = new THREE.Group();
+  const mats = {
+    white: new THREE.MeshPhysicalMaterial({ color: WHITE, roughness: 0.3, clearcoat: 1, clearcoatRoughness: 0.1 }),
+    blue: new THREE.MeshPhysicalMaterial({ color: BLUE, roughness: 0.32, clearcoat: 1, clearcoatRoughness: 0.12 }),
+    navy: new THREE.MeshStandardMaterial({ color: NAVY, roughness: 0.55 }),
+    steel: new THREE.MeshStandardMaterial({ color: 0xd9dee5, roughness: 0.25, metalness: 0.85 }),
+    glass: new THREE.MeshPhysicalMaterial({ color: 0x0c2036, roughness: 0.04, metalness: 0.1, clearcoat: 1, envMapIntensity: 1.6 }),
+    wood: new THREE.MeshStandardMaterial({ color: 0x9a6b3f, roughness: 0.45 }),
+    rope: new THREE.MeshStandardMaterial({ color: 0xe6e1d4, roughness: 0.95 }),
+  };
+  const hull = new THREE.Mesh(hullGeometry(), hullMaterial()); hull.castShadow = true; hull.receiveShadow = true;
+  const deck = new THREE.Mesh(deckGeometry(), new THREE.MeshStandardMaterial({ map: plankTexture(), roughness: 0.78 })); deck.receiveShadow = true;
+  root.add(hull, deck);
+  for (const side of [-1, 1]) {
+    const pts = []; for (let i = 0; i <= 40; i++) { const u = i / 40; pts.push(new THREE.Vector3(side * (sectionX(u, 0) - 0.04), sheerH(u) + 0.04, zOf(u))); }
+    root.add(tubeAlong(pts, 0.085, mats.wood));
+    const pts2 = []; for (let i = 0; i <= 40; i++) { const u = (i / 40) * 0.97; pts2.push(new THREE.Vector3(side * (sectionX(u, 0.13) + 0.06), sheerH(u) - 0.3 - 0.02 * u, zOf(u))); }
+    root.add(tubeAlong(pts2, 0.07, mats.navy));
+  }
+  const ts = sheerH(0), tw = sectionX(0, 0);
+  root.add(tubeAlong([new THREE.Vector3(-tw, ts + 0.04, zOf(0)), new THREE.Vector3(0, ts + 0.04, zOf(0)), new THREE.Vector3(tw, ts + 0.04, zOf(0))], 0.085, mats.wood));
+
+  // wheelhouse
+  const zc = zOf(0.6), dy = sheerH(0.6) - 0.55;
+  const cab = new THREE.Mesh(new RoundedBoxGeometry(2.7, 2.05, 2.9, 4, 0.14), mats.white); cab.position.set(0, dy + 1.02, zc);
+  const roof = new THREE.Mesh(new RoundedBoxGeometry(3.05, 0.16, 3.3, 3, 0.06), mats.blue); roof.position.set(0, dy + 2.1, zc + 0.1);
+  root.add(cab, roof);
+  for (let k = -1; k <= 1; k++) { const w = new THREE.Mesh(new THREE.BoxGeometry(0.78, 0.62, 0.04), mats.glass); w.position.set(k * 0.86, dy + 1.5, zc + 1.47); w.rotation.x = -0.12; root.add(w); }
+  for (const side of [-1, 1]) for (const dz of [-0.62, 0.62]) { const w = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.55, 0.95), mats.glass); w.position.set(side * 1.36, dy + 1.5, zc + dz); root.add(w); }
+  const door = new THREE.Mesh(new THREE.BoxGeometry(0.82, 1.6, 0.05), mats.navy); door.position.set(0.55, dy + 0.85, zc - 1.47); root.add(door);
+  const dw = new THREE.Mesh(new THREE.CircleGeometry(0.17, 20), mats.glass); dw.position.set(0.55, dy + 1.35, zc - 1.5); dw.rotation.y = Math.PI; root.add(dw);
+  const rw = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 0.04), mats.glass); rw.position.set(-0.6, dy + 1.5, zc - 1.47); root.add(rw);
+  const lb = new THREE.Group(); lb.add(new THREE.Mesh(new THREE.TorusGeometry(0.34, 0.085, 12, 40), mats.white));
+  for (let q = 0; q < 4; q++) { const seg = new THREE.Mesh(new THREE.TorusGeometry(0.34, 0.088, 12, 8, Math.PI / 6), mats.blue); seg.rotation.z = q * Math.PI / 2 - Math.PI / 12; lb.add(seg); }
+  lb.position.set(-0.6, dy + 0.75, zc - 1.52); root.add(lb);
+  // mast, spreader, radar, lights, antennas, pennant
+  const mz = zc - 0.4, my = dy + 2.18;
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 4.4, 12), mats.steel); mast.position.set(0, my + 2.2, mz); root.add(mast);
+  const spr = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 1.8, 8), mats.steel); spr.rotation.z = Math.PI / 2; spr.position.set(0, my + 3.2, mz); root.add(spr);
+  const radar = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, 0.22, 24), mats.white); radar.position.set(0, my + 2.2, mz + 0.25); root.add(radar);
+  const rb = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.6, 0.08), mats.steel); rb.position.set(0, my + 1.9, mz + 0.25); root.add(rb);
+  const light = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.16, 12), new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.6 })); light.position.set(0, my + 4.48, mz); root.add(light);
+  for (const x of [-0.54, 0.54]) { const a = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.02, 2.2, 6), mats.white); a.position.set(x, my + 1.1, zc + 1.2); root.add(a); }
+  const pg = new THREE.PlaneGeometry(1.2, 0.42, 12, 1); pg.translate(0.6, 0, 0);
+  const pen = new THREE.Mesh(pg, new THREE.MeshStandardMaterial({ color: BLUE, side: THREE.DoubleSide, roughness: 0.6 }));
+  pen.position.set(0, my + 4.15, mz); pen.rotation.y = Math.PI / 2 + 0.5; root.add(pen);
+  // stern gantry (A-frame)
+  const gz = zOf(0.06), gy = sheerH(0.06);
+  for (const x of [-1.55, 1.55]) root.add(tubeAlong([new THREE.Vector3(x, gy - 0.5, gz), new THREE.Vector3(x * 0.92, gy + 1.6, gz - 0.2), new THREE.Vector3(x * 0.6, gy + 2.5, gz - 0.35)], 0.07, mats.white));
+  root.add(tubeAlong([new THREE.Vector3(-0.93, gy + 2.5, gz - 0.35), new THREE.Vector3(0, gy + 2.5, gz - 0.35), new THREE.Vector3(0.93, gy + 2.5, gz - 0.35)], 0.075, mats.white));
+  const blk = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.12, 16), mats.navy); blk.rotation.x = Math.PI / 2; blk.position.set(0, gy + 2.32, gz - 0.35); root.add(blk);
+  // aft deck kit
+  const ady = sheerH(0.2) - 0.55;
+  const drum = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 2.0, 24), mats.navy); drum.rotation.z = Math.PI / 2; drum.position.set(0, ady + 0.75, zOf(0.17)); root.add(drum);
+  for (const x of [-1.05, 1.05]) { const d = new THREE.Mesh(new THREE.CylinderGeometry(0.75, 0.75, 0.06, 28), mats.blue); d.rotation.z = Math.PI / 2; d.position.set(x, ady + 0.75, zOf(0.17)); root.add(d); }
+  const crate = new RoundedBoxGeometry(0.85, 0.34, 0.6, 2, 0.04);
+  [[-1.1, 0, 0.36], [-1.1, 1, 0.36], [-0.2, 0, 0.36], [1.05, 0, 0.33]].forEach(([x, lvl, u]) => { const c2 = new THREE.Mesh(crate, mats.blue); c2.position.set(x, ady + 0.18 + lvl * 0.35, zOf(u)); c2.rotation.y = x * 0.06; root.add(c2); });
+  for (const x of [-1.6, 1.6]) { const b2 = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.15, 0.36, 14), mats.steel); b2.position.set(x, sheerH(0.03) - 0.38, zOf(0.04)); root.add(b2); }
+  const coil = new THREE.Mesh(new THREE.TorusGeometry(0.38, 0.07, 8, 32), mats.rope); coil.rotation.x = Math.PI / 2; coil.position.set(1.1, ady + 0.07, zOf(0.25)); root.add(coil);
+  for (const side of [-1, 1]) for (const u of [0.32, 0.5]) {
+    const x = side * (sectionX(u, 0.2) + 0.2), y = sheerH(u) - 0.85;
+    const f = new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.5, 6, 14), mats.navy); f.position.set(x, y, zOf(u)); root.add(f);
+    root.add(tubeAlong([new THREE.Vector3(side * (sectionX(u, 0) - 0.05), sheerH(u) + 0.08, zOf(u)), new THREE.Vector3(x, y + 0.42, zOf(u))], 0.012, mats.rope));
+  }
+  root.userData.pennant = pen;
+  root.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  return root;
+}
+
+function buoy(mat) {
+  const g = new THREE.Group();
+  const b = new THREE.Mesh(new THREE.SphereGeometry(0.8, 28, 18), mat); b.scale.y = 0.85;
+  const band = new THREE.Mesh(new THREE.TorusGeometry(0.62, 0.07, 8, 28), new THREE.MeshStandardMaterial({ color: NAVY, roughness: 0.5 })); band.rotation.x = Math.PI / 2; band.position.y = 0.3;
+  const p = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 1.8, 10), new THREE.MeshStandardMaterial({ color: 0xd9dee5, metalness: 0.8, roughness: 0.3 })); p.position.y = 1.4;
+  const top = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.4, 16), mat); top.position.y = 2.45;
+  g.add(b, band, p, top); return g;
+}
+
+function lighthouse() {
+  const g = new THREE.Group();
+  const white = new THREE.MeshStandardMaterial({ color: 0xf4f6f9, roughness: 0.6 });
+  const rock = new THREE.Mesh(new THREE.IcosahedronGeometry(60, 1), new THREE.MeshStandardMaterial({ color: 0x9fb2c4, roughness: 0.95, flatShading: true }));
+  rock.scale.set(1.8, 0.28, 0.7); rock.position.y = -4;
+  const tower = new THREE.Mesh(new THREE.CylinderGeometry(3.2, 4.4, 28, 20), white); tower.position.set(10, 22, 0);
+  const lamp = new THREE.Mesh(new THREE.CylinderGeometry(3.6, 3.6, 3, 20), new THREE.MeshStandardMaterial({ color: BLUE })); lamp.position.set(10, 37, 0);
+  const cap = new THREE.Mesh(new THREE.ConeGeometry(4.2, 4, 20), new THREE.MeshStandardMaterial({ color: BLUE })); cap.position.set(10, 40.5, 0);
+  g.add(rock, tower, lamp, cap); return g;
+}
+
+function seaGeometry() {
+  // dense near the boat, coarse far away: one mesh, ~9 km wide
+  const g = new THREE.PlaneGeometry(2, 2, 360, 360), p = g.attributes.position;
+  const f = (s) => Math.sign(s) * (Math.abs(s) * 70 + Math.pow(Math.abs(s), 4) * 4430);
+  for (let i = 0; i < p.count; i++) p.setXY(i, f(p.getX(i)), f(p.getY(i)));
+  g.computeBoundingSphere(); g.boundingSphere.radius = 1e5;
+  return g;
+}
+
+function seaMaterial(water, slope) {
+  const m = water.material;
+  m.defines = Object.assign({}, m.defines, { o_slope: slope.toFixed(2) });
+  m.vertexShader = m.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec2 vSlope;\n' + GLSL_SWELL)
+    .replace('void main() {', 'void main() {\n vec3 wp = position; vec2 gr; wp.z += swellH(vec2(position.x, -position.y), time * 2.0, gr); vSlope = gr;')
+    .replace(/vec4\( position, 1\.0 \)/g, 'vec4( wp, 1.0 )');
+  m.fragmentShader = m.fragmentShader
+    .replace('varying vec4 worldPosition;', 'varying vec4 worldPosition;\nvarying vec2 vSlope;')
+    .replace('vec3 surfaceNormal = normalize( noise.xzy * vec3( 1.5, 1.0, 1.5 ) );', 'vec3 surfaceNormal = normalize( noise.xzy * vec3( 1.2, 1.0, 1.2 ) + vec3( -vSlope.x, 0.0, -vSlope.y ) * (o_slope) );')
+    .replace('float rf0 = 0.3;', 'float rf0 = 0.05;')
+    .replace('vec3 scatter = max( 0.0, dot( surfaceNormal, eyeDirection ) ) * waterColor;', 'float crest = smoothstep(-0.1, 0.5, worldPosition.y); vec3 scatter = (0.5 + 0.5 * max( 0.0, dot( surfaceNormal, eyeDirection ) )) * mix(waterColor, waterColor * 1.6 + vec3(0.0, 0.06, 0.05), crest * 0.5);');
+  m.needsUpdate = true;
+}
+
+function foamMaterial() {
+  const tex = foamNoise(256);
+  return new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false,
+    uniforms: { tNoise: { value: tex }, time: { value: 0 } },
+    vertexShader: `uniform float time; varying vec2 vP; ${GLSL_SWELL}
+      void main(){ vec3 p = position; vec2 g; p.y = swellH(p.xz, time, g) + 0.04; vP = p.xz; gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0); }`,
+    fragmentShader: `uniform sampler2D tNoise; uniform float time; varying vec2 vP; ${GLSL_BEAM}
+      void main(){
+        vec2 p = vP; float spd = 3.2;
+        float n = texture2D(tNoise, vec2(p.x, p.y + time * spd) * 0.09).r * 0.55 + texture2D(tNoise, vec2(p.x * 1.3 + 0.37, p.y + time * spd) * 0.23).r * 0.45;
+        float stern = ${zOf(0).toFixed(3)}, bow = ${zOf(1).toFixed(3)};
+        float f = 0.0;
+        float d = stern - p.y;
+        if (d > 0.0) {
+          float w = 1.4 + d * 0.11;
+          float prop = exp(-pow(p.x / w, 2.0)) * exp(-d / 26.0) * 1.25;
+          float arm = exp(-pow((abs(p.x) - (2.2 + d * 0.36)) / (0.45 + d * 0.035), 2.0)) * exp(-d / 34.0);
+          f = max(prop, arm * 0.8);
+        }
+        float u = (p.y - stern) / (bow - stern);
+        if (u > -0.02 && u < 1.08) {
+          float b = halfBeam(clamp(u, 0.0, 1.0)) * 0.94;
+          float dd = abs(abs(p.x) - b);
+          float bowk = smoothstep(0.55, 1.0, u);
+          f = max(f, exp(-pow(dd / (0.28 + 0.6 * bowk), 2.0)) * (0.45 + 0.9 * bowk));
+        }
+        if (u > 0.8 && u < 1.5) { float arm2 = exp(-pow((abs(p.x) - (u - 0.8) * 9.0) / 0.35, 2.0)) * (1.0 - smoothstep(1.0, 1.5, u)); f = max(f, arm2 * 0.9); }
+        float foam = smoothstep(0.32, 0.62, n * 0.8 + f * 0.55) * clamp(f * 1.4, 0.0, 1.0);
+        gl_FragColor = vec4(vec3(0.96, 0.98, 1.0), foam * 0.92);
+      }`,
+  });
+}
+
+export function mount(canvas, opts) {
+  const o = Object.assign({ deck: -9, still: false, cam: 'desk' }, opts);
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = o.exp || 0.92;
+  renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  const scene = new THREE.Scene();
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(8000, 48, 24), new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false, fog: false,
+    uniforms: { top: { value: new THREE.Color(0x6aa3dc) }, mid: { value: new THREE.Color(0xa9cdee) }, hor: { value: new THREE.Color(0xe6f0f9) }, sun: { value: SUN.clone() } },
+    vertexShader: 'varying vec3 vD; void main(){ vD = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: 'uniform vec3 top; uniform vec3 mid; uniform vec3 hor; uniform vec3 sun; varying vec3 vD; void main(){ float h = max(vD.y, 0.0); vec3 c = mix(hor, mid, smoothstep(0.0, 0.08, h)); c = mix(c, top, smoothstep(0.08, 0.5, h)); float s = max(dot(normalize(vD), normalize(sun)), 0.0); c += vec3(1.0,0.95,0.86) * (pow(s, 12.0) * 0.18 + pow(s, 200.0) * 0.5 + smoothstep(0.99965, 0.9998, s) * 2.0); gl_FragColor = vec4(c, 1.0); }',
+  }));
+  const lit = new THREE.Scene(); lit.add(sky.clone());
+  scene.environment = new THREE.PMREMGenerator(renderer).fromScene(lit).texture;
+  scene.environmentIntensity = 1.0;
+  scene.fog = new THREE.Fog(0xdde9f5, 500, 3400);
+  const sun = new THREE.DirectionalLight(0xfff0d8, 3.0);
+  sun.position.copy(SUN).multiplyScalar(60); sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
+  Object.assign(sun.shadow.camera, { left: -11, right: 11, top: 11, bottom: -11, near: 1, far: 140 });
+  sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.02; sun.shadow.radius = 3;
+  const hemi = new THREE.HemisphereLight(0xeaf4ff, 0x4b7fb3, 1.25);
+  const water = new Water(o.plain ? new THREE.PlaneGeometry(9000, 9000) : seaGeometry(), {
+    textureWidth: 1024, textureHeight: 1024, waterNormals: normalMap(512), sunDirection: SUN.clone(),
+    sunColor: 0xfff4e2, waterColor: o.water || 0x0f5fb8, distortionScale: 2.6, fog: true,
+  });
+  water.rotation.x = -Math.PI / 2; water.receiveShadow = false; water.material.uniforms.size.value = 2.0;
+  if (!o.noSwell) seaMaterial(water, o.slope || 0.9);
+  scene.add(sky, sun, sun.target, hemi, water);
+
+  const ship = boat(); scene.add(ship);
+  const foam = new THREE.Mesh(new THREE.PlaneGeometry(90, 110, 180, 220).rotateX(-Math.PI / 2).translate(0, 0, -40), foamMaterial());
+  foam.renderOrder = 2; scene.add(foam);
+  const bmat = new THREE.MeshPhysicalMaterial({ color: WHITE, roughness: 0.3, clearcoat: 1 });
+  const bmatOn = new THREE.MeshPhysicalMaterial({ color: BLUE, roughness: 0.3, clearcoat: 1 });
+  const buoys = [];
+  for (let i = 0; i < 4; i++) {
+    const b = buoy(i === 3 ? bmatOn : bmat);
+    const P = [[12, 46], [-20, 92], [16, 150], [-30, 78]][i]; b.position.set(P[0], 0, P[1]);
+    scene.add(b); buoys.push(b);
+  }
+  const lh = lighthouse(); lh.position.set(-170, 0, 820); lh.rotation.y = 0.6; scene.add(lh);
+  const far = new THREE.Mesh(new THREE.IcosahedronGeometry(300, 1), new THREE.MeshStandardMaterial({ color: 0xb4c6d6, roughness: 1, flatShading: true }));
+  far.scale.set(2.6, 0.16, 0.6); far.position.set(520, -6, 1700); scene.add(far);
+
+  const mob = o.cam === 'mob';
+  const cam = new THREE.PerspectiveCamera(mob ? 52 : 40, canvas.clientWidth / canvas.clientHeight, 0.3, 9000);
+  const camPos = o.camPos ? new THREE.Vector3(...o.camPos) : mob ? new THREE.Vector3(5, 8.4, -27) : new THREE.Vector3(7.5, 7.4, -27);
+  const camAim = o.camAim ? new THREE.Vector3(...o.camAim) : mob ? new THREE.Vector3(0.6, 1.2, 12) : new THREE.Vector3(-2.2, 2.4, 14);
+
+  const base = THREE.MathUtils.degToRad(o.deck);
+  let t = 0, last = performance.now();
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const pen = ship.userData.pennant, penPos = pen.geometry.attributes.position, penX = Float32Array.from({ length: penPos.count }, (_, i) => penPos.getX(i));
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now; t += (reduce || o.still) ? 0 : dt;
+    const T = (o.t0 || 6) + t;
+    const sw = swell(0, 0, T * 2.0), swB = swell(0, 5, T * 2.0), swS = swell(0, -5, T * 2.0);
+    ship.position.y = (sw.h + swB.h + swS.h) / 3 - 0.08;
+    ship.rotation.x = -Math.atan2(swB.h - swS.h, 10) * 0.8;
+    ship.rotation.z = -(base + THREE.MathUtils.degToRad(1.4 * Math.sin(T * 0.8)));
+    buoys.forEach((b) => { const s = swell(b.position.x, b.position.z, T * 2.0); b.position.y = s.h - 0.15; b.rotation.z = -s.gx * 0.6; b.rotation.x = s.gz * 0.6; });
+    for (let i = 0; i < penPos.count; i++) penPos.setZ(i, Math.sin(penX[i] * 3.2 - T * 7) * 0.09 * penX[i]);
+    penPos.needsUpdate = true;
+    water.material.uniforms.time.value = T;
+    foam.material.uniforms.time.value = T * 2.0;
+    cam.position.copy(camPos); cam.position.y += sw.h * 0.35; cam.lookAt(camAim);
+    renderer.render(scene, cam);
+    if (!(reduce || o.still)) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  return { project(i) { const v = buoys[i].position.clone().add(new THREE.Vector3(0, 3.0, 0)).project(cam); return [(v.x + 1) / 2, (1 - v.y) / 2]; } };
+}
